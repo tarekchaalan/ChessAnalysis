@@ -79,7 +79,6 @@ This project enhances chess analysis capabilities with advanced features and cus
 | 🛡️ | **Security**      | <ul><li>No security features implemented</li><li>Basic input validation</li></ul> |
 | 📦 | **Dependencies**  | <ul><li>Relies on Stockfish library</li><li>Sound files included in project</li></ul> |
 | 🚀 | **Scalability**   | <ul><li>Limited by single-threaded execution</li><li>Potential for multi-threading with Stockfish</li></ul> |
-```
 
 ---
 
