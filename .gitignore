@@ -1,5 +1,6 @@
 ## macOS
 .DS_Store
+**/.DS_Store
 
 ## Xcode
 build/
@@ -34,3 +35,5 @@ fastlane/test_output/
 ## Playgrounds
 timeline.xctimeline
 playground.xcworkspace
+
+./README-og.md
