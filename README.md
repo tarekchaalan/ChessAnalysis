@@ -3,12 +3,12 @@
 <!-- HEADER STYLE: MODERN -->
 <div align="center" style="width: 100%;">
 
-<img src="https://github.com/tarekchaalan/ChessAnalysis/blob/main/Logo.png" width="35%" style="display: block; margin: 0 auto;" alt="AppIcon" />
+<img src="./Logo.png" width="35%" style="display: block; margin: 0 auto;" alt="AppIcon" />
 
 
 # CHESSANALYSIS
 
-<em>Master Chess with Precision and Insightful Analysis<em>
+<em>Master Chess with Precision and Insightful Analysis - For Free<em>
 
 <!-- BADGES -->
 <img src="https://img.shields.io/github/license/tarekchaalan/ChessAnalysis?style=flat&logo=opensourceinitiative&logoColor=white&color=#69923e" alt="license">
@@ -41,12 +41,9 @@
 - [Getting Started](#getting-started)
     - [Prerequisites](#prerequisites)
     - [Installation](#installation)
-    - [Usage](#usage)
-    - [Testing](#testing)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [License](#license)
-- [Acknowledgments](#acknowledgments)
 
 </details>
 
@@ -1147,10 +1144,12 @@ This project enhances chess analysis capabilities with advanced features and cus
 This project requires the following dependencies:
 
 - **Programming Language:** Swift
+- **IDE:** Xcode
+
 
 ### Installation
 
-Build ChessAnalysis from the source and intsall dependencies:
+Build ChessAnalysis from the source:
 
 1. **Clone the repository:**
 
