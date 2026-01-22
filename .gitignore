@@ -1,0 +1,36 @@
+## macOS
+.DS_Store
+
+## Xcode
+build/
+DerivedData/
+*.xcscmblueprint
+*.xccheckout
+*.xcuserstate
+
+## Xcode user settings
+xcuserdata/
+*.moved-aside
+*.xccheckout
+*.xcuserstate
+
+## Swift Package Manager
+.build/
+Packages/
+Package.resolved
+
+## CocoaPods
+Pods/
+
+## Carthage
+Carthage/Build/
+
+## Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+
+## Playgrounds
+timeline.xctimeline
+playground.xcworkspace
