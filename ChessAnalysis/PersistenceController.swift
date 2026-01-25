@@ -6,6 +6,7 @@ final class PersistenceController {
     static let shared = PersistenceController()
 
     let container: NSPersistentContainer
+    private(set) var loadError: Error?
 
     init(inMemory: Bool = false) {
         let model = NSManagedObjectModel()
@@ -13,15 +14,71 @@ final class PersistenceController {
         model.entities = [gameEntity, analysisEntity]
 
         container = NSPersistentContainer(name: "ChessAnalysis", managedObjectModel: model)
-        if inMemory {
-            container.persistentStoreDescriptions.first?.url = URL(fileURLWithPath: "/dev/null")
+
+        // Enable lightweight migration
+        if let description = container.persistentStoreDescriptions.first {
+            description.setOption(true as NSNumber, forKey: NSMigratePersistentStoresAutomaticallyOption)
+            description.setOption(true as NSNumber, forKey: NSInferMappingModelAutomaticallyOption)
+
+            if inMemory {
+                description.url = URL(fileURLWithPath: "/dev/null")
+            }
         }
-        container.loadPersistentStores { _, error in
+
+        container.loadPersistentStores { [weak self] _, error in
             if let error {
-                fatalError("Failed to load store: \(error)")
+                self?.loadError = error
+                print("[PersistenceController] Failed to load store: \(error)")
+
+                // Attempt recovery by deleting corrupted store
+                if let self, !inMemory {
+                    self.attemptRecovery()
+                }
             }
         }
         container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
+    }
+
+    /// Check if the store loaded successfully
+    var isStoreLoaded: Bool {
+        loadError == nil
+    }
+
+    /// Attempt to recover from a corrupted store by deleting and recreating it
+    private func attemptRecovery() {
+        guard let storeURL = container.persistentStoreDescriptions.first?.url else { return }
+
+        print("[PersistenceController] Attempting recovery by recreating store...")
+
+        // Remove existing store files
+        let coordinator = container.persistentStoreCoordinator
+        do {
+            if let store = coordinator.persistentStores.first {
+                try coordinator.remove(store)
+            }
+
+            // Delete store files
+            try? FileManager.default.removeItem(at: storeURL)
+
+            // Also remove WAL and SHM files if they exist
+            let walURL = storeURL.appendingPathExtension("wal")
+            let shmURL = storeURL.appendingPathExtension("shm")
+            try? FileManager.default.removeItem(at: walURL)
+            try? FileManager.default.removeItem(at: shmURL)
+
+            // Reload the store
+            container.loadPersistentStores { [weak self] _, error in
+                if let error {
+                    self?.loadError = error
+                    print("[PersistenceController] Recovery failed: \(error)")
+                } else {
+                    self?.loadError = nil
+                    print("[PersistenceController] Recovery successful - store recreated")
+                }
+            }
+        } catch {
+            print("[PersistenceController] Recovery failed during cleanup: \(error)")
+        }
     }
 
     private static func makeEntities() -> (NSEntityDescription, NSEntityDescription) {

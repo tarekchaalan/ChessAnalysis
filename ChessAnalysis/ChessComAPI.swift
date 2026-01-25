@@ -1,5 +1,31 @@
 import Foundation
 
+enum ChessComAPIError: LocalizedError {
+    case invalidResponse
+    case httpError(statusCode: Int, message: String?)
+    case userNotFound(username: String)
+    case rateLimited
+    case networkError(Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidResponse:
+            return "Invalid response from Chess.com server."
+        case .httpError(let statusCode, let message):
+            if let message {
+                return "Chess.com error (\(statusCode)): \(message)"
+            }
+            return "Chess.com request failed with status \(statusCode)."
+        case .userNotFound(let username):
+            return "User '\(username)' not found on Chess.com."
+        case .rateLimited:
+            return "Too many requests. Please wait a moment and try again."
+        case .networkError(let error):
+            return "Network error: \(error.localizedDescription)"
+        }
+    }
+}
+
 struct ChessComAPI {
     private let baseURL = URL(string: "https://api.chess.com/pub")!
     private let session: URLSession
@@ -11,6 +37,8 @@ struct ChessComAPI {
         configuration.httpAdditionalHeaders = [
             "User-Agent": "Local Chess Analyzer iOS/1.0"
         ]
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 60
         session = URLSession(configuration: configuration)
     }
 
@@ -18,20 +46,22 @@ struct ChessComAPI {
         let url = baseURL.appendingPathComponent("player/\(username.lowercased())/games/archives")
         var request = URLRequest(url: url)
         addAuthHeader(to: &request)
-        let (data, _) = try await session.data(for: request)
+        let (data, response) = try await performRequest(request)
+        try validateResponse(response, for: username)
         let decoder = JSONDecoder()
-        let response = try decoder.decode(ArchivesResponse.self, from: data)
-        return response.archives.compactMap { URL(string: $0) }
+        let archivesResponse = try decoder.decode(ArchivesResponse.self, from: data)
+        return archivesResponse.archives.compactMap { URL(string: $0) }
     }
 
     func fetchGamesFromArchive(_ archiveURL: URL) async throws -> [RemoteGame] {
         var request = URLRequest(url: archiveURL)
         addAuthHeader(to: &request)
-        let (data, _) = try await session.data(for: request)
+        let (data, response) = try await performRequest(request)
+        try validateResponse(response, for: nil)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .secondsSince1970
-        let response = try decoder.decode(ArchiveGamesResponse.self, from: data)
-        return response.games.map { mapRemoteGame($0) }
+        let archiveResponse = try decoder.decode(ArchiveGamesResponse.self, from: data)
+        return archiveResponse.games.map { mapRemoteGame($0) }
     }
 
     func fetchAllGames(username: String, limitMonths: Int?, since: Date? = nil) async throws -> [RemoteGame] {
@@ -45,6 +75,10 @@ struct ChessComAPI {
 
         var allGames: [RemoteGame] = []
         for archive in archives {
+            // Add small delay between requests to avoid rate limiting
+            if !allGames.isEmpty {
+                try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            }
             let games = try await fetchGamesFromArchive(archive)
             if let since {
                 allGames.append(contentsOf: games.filter { ($0.endTime ?? .distantPast) >= since })
@@ -59,9 +93,80 @@ struct ChessComAPI {
         let url = baseURL.appendingPathComponent("player/\(username.lowercased())")
         var request = URLRequest(url: url)
         addAuthHeader(to: &request)
-        let (data, _) = try await session.data(for: request)
+        let (data, response) = try await performRequest(request)
+        try validateResponse(response, for: username)
         let decoder = JSONDecoder()
         return try decoder.decode(ChessComPlayer.self, from: data)
+    }
+
+    private func performRequest(_ request: URLRequest, maxRetries: Int = 3) async throws -> (Data, URLResponse) {
+        var lastError: Error?
+        var delay: UInt64 = 500_000_000 // Start with 500ms
+
+        for attempt in 0..<maxRetries {
+            do {
+                try Task.checkCancellation()
+                let (data, response) = try await session.data(for: request)
+
+                // Check if we should retry based on status code
+                if let httpResponse = response as? HTTPURLResponse {
+                    switch httpResponse.statusCode {
+                    case 429: // Rate limited - retry with backoff
+                        if attempt < maxRetries - 1 {
+                            try await Task.sleep(nanoseconds: delay * 2) // Longer delay for rate limiting
+                            delay *= 2
+                            continue
+                        }
+                    case 500...599: // Server error - retry
+                        if attempt < maxRetries - 1 {
+                            try await Task.sleep(nanoseconds: delay)
+                            delay *= 2
+                            continue
+                        }
+                    default:
+                        break
+                    }
+                }
+
+                return (data, response)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let urlError as URLError where urlError.code == .timedOut || urlError.code == .networkConnectionLost {
+                // Retry on timeout or connection lost
+                lastError = urlError
+                if attempt < maxRetries - 1 {
+                    try await Task.sleep(nanoseconds: delay)
+                    delay *= 2
+                    continue
+                }
+            } catch {
+                lastError = error
+                // Don't retry other errors
+                break
+            }
+        }
+
+        throw ChessComAPIError.networkError(lastError ?? URLError(.unknown))
+    }
+
+    private func validateResponse(_ response: URLResponse, for username: String?) throws {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ChessComAPIError.invalidResponse
+        }
+
+        switch httpResponse.statusCode {
+        case 200...299:
+            return // Success
+        case 404:
+            if let username {
+                throw ChessComAPIError.userNotFound(username: username)
+            }
+            throw ChessComAPIError.httpError(statusCode: 404, message: "Resource not found")
+        case 429:
+            throw ChessComAPIError.rateLimited
+        default:
+            throw ChessComAPIError.httpError(statusCode: httpResponse.statusCode, message: nil)
+        }
     }
 
     private func addAuthHeader(to request: inout URLRequest) {

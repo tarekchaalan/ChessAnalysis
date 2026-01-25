@@ -313,13 +313,17 @@ struct GameReviewView: View {
     }
 
     private func moveCell(analysis: MoveAnalysis?, san: String?) -> some View {
-        HStack(spacing: 6) {
-            if let classification = analysis?.classification,
+        let classification = analysis?.classification
+        let accessibilityLabel = buildMoveAccessibilityLabel(san: san, classification: classification)
+
+        return HStack(spacing: 6) {
+            if let classification,
                let assetName = classificationAssetName(classification) {
                 Image(assetName)
                     .resizable()
                     .scaledToFit()
                     .frame(width: 16, height: 16)
+                    .accessibilityHidden(true) // Hide from VoiceOver, included in parent label
             } else {
                 Color.clear
                     .frame(width: 16, height: 16)
@@ -327,6 +331,45 @@ struct GameReviewView: View {
             Text(san ?? "--")
                 .font(.subheadline)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private func buildMoveAccessibilityLabel(san: String?, classification: String?) -> String {
+        guard let san else { return "No move" }
+
+        var label = san
+
+        if let classification {
+            let classificationDescription: String
+            switch classification.lowercased() {
+            case "brilliant":
+                classificationDescription = "Brilliant move"
+            case "great":
+                classificationDescription = "Great move"
+            case "best":
+                classificationDescription = "Best move"
+            case "excellent":
+                classificationDescription = "Excellent move"
+            case "good":
+                classificationDescription = "Good move"
+            case "book":
+                classificationDescription = "Book move"
+            case "inaccuracy":
+                classificationDescription = "Inaccuracy"
+            case "mistake":
+                classificationDescription = "Mistake"
+            case "blunder":
+                classificationDescription = "Blunder"
+            case "miss":
+                classificationDescription = "Missed opportunity"
+            default:
+                classificationDescription = classification
+            }
+            label = "\(san), \(classificationDescription)"
+        }
+
+        return label
     }
 
     private func movePairs() -> [MovePair] {

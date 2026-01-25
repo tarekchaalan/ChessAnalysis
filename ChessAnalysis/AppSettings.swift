@@ -4,11 +4,20 @@ import UIKit
 
 final class AppSettings: ObservableObject {
     private let lowPowerOverrideKey = "analysis.lowPower.override"
+    private let tokenKeychainKey = "chesscom.token"
+
     @Published var username: String {
         didSet { UserDefaults.standard.set(username, forKey: "chesscom.username") }
     }
     @Published var token: String {
-        didSet { UserDefaults.standard.set(token, forKey: "chesscom.token") }
+        didSet {
+            // Store token securely in Keychain
+            if token.isEmpty {
+                KeychainHelper.delete(key: tokenKeychainKey)
+            } else {
+                try? KeychainHelper.save(key: tokenKeychainKey, value: token)
+            }
+        }
     }
     @Published var storageCapMB: Int {
         didSet { UserDefaults.standard.set(storageCapMB, forKey: "storage.cap.mb") }
@@ -21,9 +30,16 @@ final class AppSettings: ObservableObject {
     }
 
     init() {
+        // Migrate token from UserDefaults to Keychain if needed
+        KeychainHelper.migrateFromUserDefaults(
+            userDefaultsKey: "chesscom.token",
+            keychainKey: "chesscom.token"
+        )
+
         let storedCap = UserDefaults.standard.integer(forKey: "storage.cap.mb")
         self.username = UserDefaults.standard.string(forKey: "chesscom.username") ?? ""
-        self.token = UserDefaults.standard.string(forKey: "chesscom.token") ?? ""
+        // Load token from Keychain (secure storage)
+        self.token = KeychainHelper.load(key: "chesscom.token") ?? ""
         self.storageCapMB = storedCap == 0 ? 500 : storedCap
         self.coachLines = UserDefaults.standard.bool(forKey: "analysis.coachLines")
         self.lowPowerAnalysis = UserDefaults.standard.bool(forKey: "analysis.lowPower")

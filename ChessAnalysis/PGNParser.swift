@@ -1,9 +1,22 @@
 import Foundation
 
 enum PGNParser {
+    // Pre-compiled regex patterns for better performance
+    private static let headerRegexCache = NSCache<NSString, NSRegularExpression>()
+
     static func extractHeader(from pgn: String, key: String) -> String? {
-        let pattern = "\\[\(NSRegularExpression.escapedPattern(for: key))\\s+\\\"([^\\\"]*)\\\"\\]"
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return nil }
+        // Check cache first
+        let cacheKey = key as NSString
+        let regex: NSRegularExpression
+        if let cached = headerRegexCache.object(forKey: cacheKey) {
+            regex = cached
+        } else {
+            let pattern = "\\[\(NSRegularExpression.escapedPattern(for: key))\\s+\\\"([^\\\"]*)\\\"\\]"
+            guard let newRegex = try? NSRegularExpression(pattern: pattern, options: []) else { return nil }
+            headerRegexCache.setObject(newRegex, forKey: cacheKey)
+            regex = newRegex
+        }
+
         let range = NSRange(pgn.startIndex..<pgn.endIndex, in: pgn)
         guard let match = regex.firstMatch(in: pgn, options: [], range: range),
               match.numberOfRanges > 1,
@@ -13,6 +26,9 @@ enum PGNParser {
     }
 
     static func extractMoves(from pgn: String) -> [String] {
+        // Limit input size to prevent DoS
+        guard pgn.count < 1_000_000 else { return [] }
+
         // Try to find moves section - either after double newline or after last header
         var movesSection: String
 
@@ -49,6 +65,7 @@ enum PGNParser {
         text = text.replacingOccurrences(of: "\t", with: " ")
         let tokens = text.split(separator: " ").map(String.init)
         var moves: [String] = []
+        moves.reserveCapacity(tokens.count / 2) // Optimize array allocation
         for token in tokens {
             if token.isEmpty { continue }
             // Skip move numbers (contain a dot)
@@ -64,22 +81,40 @@ enum PGNParser {
         return moves
     }
 
+    /// Remove PGN comments {like this} with proper nesting support - O(n) single pass
     private static func removePGNComments(from text: String) -> String {
-        var output = text
-        while let start = output.firstIndex(of: "{"),
-              let end = output[start...].firstIndex(of: "}") {
-            output.removeSubrange(start...end)
+        var result = ""
+        result.reserveCapacity(text.count)
+        var depth = 0
+
+        for char in text {
+            if char == "{" {
+                depth += 1
+            } else if char == "}" {
+                depth = max(0, depth - 1)
+            } else if depth == 0 {
+                result.append(char)
+            }
         }
-        return output
+        return result
     }
 
+    /// Remove PGN variations (like this) with proper nesting support - O(n) single pass
     private static func removePGNVariations(from text: String) -> String {
-        var output = text
-        while let start = output.firstIndex(of: "("),
-              let end = output[start...].firstIndex(of: ")") {
-            output.removeSubrange(start...end)
+        var result = ""
+        result.reserveCapacity(text.count)
+        var depth = 0
+
+        for char in text {
+            if char == "(" {
+                depth += 1
+            } else if char == ")" {
+                depth = max(0, depth - 1)
+            } else if depth == 0 {
+                result.append(char)
+            }
         }
-        return output
+        return result
     }
 
     static func extractClockTimes(from pgn: String) -> [String] {

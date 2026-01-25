@@ -92,7 +92,8 @@ struct ChessPosition: Hashable {
     static func squareName(index: Int) -> String {
         let file = index % 8
         let rank = 8 - (index / 8)
-        let fileChar = String(UnicodeScalar(97 + file)!)
+        guard let scalar = UnicodeScalar(97 + file) else { return "a\(rank)" }
+        let fileChar = String(scalar)
         return "\(fileChar)\(rank)"
     }
 
@@ -279,7 +280,8 @@ enum SANParser {
             let chars = Array(san)
             if chars.count >= 2, chars[1] == "x" {
                 let fileChar = chars[0]
-                let file = Int(fileChar.unicodeScalars.first!.value) - 97
+                guard let scalar = fileChar.unicodeScalars.first else { return (nil, nil) }
+                let file = Int(scalar.value) - 97
                 return (file, nil)
             }
             return (nil, nil)
@@ -294,10 +296,11 @@ enum SANParser {
         var file: Int?
         var rank: Int?
         for ch in dis {
+            guard let scalar = ch.unicodeScalars.first else { continue }
             if ch >= "a" && ch <= "h" {
-                file = Int(ch.unicodeScalars.first!.value) - 97
+                file = Int(scalar.value) - 97
             } else if ch >= "1" && ch <= "8" {
-                rank = 8 - (Int(ch.unicodeScalars.first!.value) - 48)
+                rank = 8 - (Int(scalar.value) - 48)
             }
         }
         return (file, rank)

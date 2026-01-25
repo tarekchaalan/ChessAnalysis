@@ -178,12 +178,23 @@ actor GameStore {
         try await context.perform {
             let fetch: NSFetchRequest<GameEntity> = GameEntity.fetchRequest()
             fetch.predicate = NSPredicate(format: "id == %@", gameId as CVarArg)
-            if let game = try context.fetch(fetch).first {
-                if FileManager.default.fileExists(atPath: game.pgnPath) {
-                    try FileManager.default.removeItem(atPath: game.pgnPath)
+            guard let game = try context.fetch(fetch).first else { return }
+
+            let pgnPath = game.pgnPath
+
+            // Delete from database first
+            context.delete(game)
+            try context.save()
+
+            // Only delete file after database save succeeds
+            // This prevents orphaned DB records if file deletion fails
+            if FileManager.default.fileExists(atPath: pgnPath) {
+                do {
+                    try FileManager.default.removeItem(atPath: pgnPath)
+                } catch {
+                    // Log but don't fail - orphaned file is better than orphaned DB record
+                    print("[GameStore] Failed to delete PGN file at \(pgnPath): \(error)")
                 }
-                context.delete(game)
-                try context.save()
             }
         }
     }

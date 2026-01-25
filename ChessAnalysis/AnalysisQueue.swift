@@ -3,9 +3,16 @@ import UIKit
 
 actor AnalysisQueue {
     static let shared = AnalysisQueue()
-    private var currentTask: Task<Void, Error>?
+
+    private enum State {
+        case idle
+        case processing
+        case cancelling
+    }
+
+    private var currentTask: Task<Void, Never>?
     private var queue: [@Sendable () async throws -> Void] = []
-    private var isProcessing = false
+    private var state: State = .idle
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     func enqueue(_ operation: @escaping @Sendable () async throws -> Void) {
@@ -14,34 +21,50 @@ actor AnalysisQueue {
     }
 
     func cancel() {
+        guard state == .processing else {
+            // Already idle or cancelling
+            queue.removeAll()
+            return
+        }
+        state = .cancelling
         currentTask?.cancel()
-        currentTask = nil
         queue.removeAll()
-        isProcessing = false
-        endBackgroundTask()
+        // State will be set to idle when processQueue exits
+    }
+
+    var queueCount: Int {
+        queue.count
+    }
+
+    var isIdle: Bool {
+        state == .idle
     }
 
     private func startIfNeeded() {
-        guard !isProcessing else { return }
-        isProcessing = true
+        guard state == .idle else { return }
+        state = .processing
         beginBackgroundTask()
-        currentTask = Task { [weak self] in
-            await self?.processQueue()
+        currentTask = Task {
+            await self.processQueue()
         }
     }
 
     private func processQueue() async {
-        while !queue.isEmpty {
+        while state == .processing && !queue.isEmpty {
             let operation = queue.removeFirst()
             do {
+                try Task.checkCancellation()
                 try await operation()
             } catch is CancellationError {
+                // Cancelled, exit loop
                 break
             } catch {
+                // Operation failed, continue with next
                 continue
             }
         }
-        isProcessing = false
+        // Clean up
+        state = .idle
         currentTask = nil
         endBackgroundTask()
     }

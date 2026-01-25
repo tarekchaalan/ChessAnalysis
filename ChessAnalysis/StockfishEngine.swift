@@ -66,11 +66,16 @@ actor StockfishEngine {
 
     private func scheduleIdleShutdown() {
         idleTask?.cancel()
+        idleTask = nil
         let timeout = idleTimeoutSeconds
-        idleTask = Task {
-            try? await Task.sleep(nanoseconds: timeout * 1_000_000_000)
-            guard !Task.isCancelled else { return }
-            await self.enterLowPowerMode()
+        idleTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: timeout * 1_000_000_000)
+                guard !Task.isCancelled else { return }
+                await self?.enterLowPowerMode()
+            } catch {
+                // Task was cancelled, which is expected
+            }
         }
     }
 
@@ -226,20 +231,35 @@ actor StockfishEngine {
         }
     }
 
-    private func readUntil(prefix: String) async throws -> String {
-        while true {
-            let line = try await readLine()
+    private func readUntil(prefix: String, timeoutSeconds: Double = 30) async throws -> String {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            let line = try await readLine(timeoutSeconds: timeoutSeconds)
             if line.hasPrefix(prefix) { return line }
         }
+        throw StockfishError.timeout
     }
 
-    private func readLine() async throws -> String {
-        while true {
+    private func readLine(timeoutSeconds: Double = 30) async throws -> String {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        var attemptCount = 0
+        let maxAttempts = Int(timeoutSeconds * 100) // 10ms per attempt
+
+        while attemptCount < maxAttempts {
+            try Task.checkCancellation()
+
             if let linePtr = sf_read_line() {
                 return String(cString: linePtr).trimmingCharacters(in: .whitespacesAndNewlines)
             }
+
+            if Date() >= deadline {
+                throw StockfishError.timeout
+            }
+
             try await Task.sleep(nanoseconds: 10_000_000)
+            attemptCount += 1
         }
+        throw StockfishError.timeout
     }
 
     private func readLineIfAvailable() -> String? {
@@ -271,6 +291,19 @@ actor StockfishEngine {
     }
 }
 
-enum StockfishError: Error {
+enum StockfishError: LocalizedError {
     case notRunning
+    case timeout
+    case engineCrashed
+
+    var errorDescription: String? {
+        switch self {
+        case .notRunning:
+            return "Chess engine is not running."
+        case .timeout:
+            return "Chess engine timed out. Please try again."
+        case .engineCrashed:
+            return "Chess engine stopped unexpectedly. Please restart analysis."
+        }
+    }
 }

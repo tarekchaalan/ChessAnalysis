@@ -5,7 +5,7 @@ actor AnalysisService {
     @MainActor static let shared = AnalysisService(store: GameStore.shared)
 
     private let store: GameStore
-    private let engine = StockfishEngine.shared
+    nonisolated private let engine = StockfishEngine.shared
 
     init(store: GameStore) {
         self.store = store
@@ -28,7 +28,7 @@ actor AnalysisService {
             completed += 1
             progress?(completed, total)
         }
-        let accuracy = computeAccuracy(moves: collected)
+        let accuracy = Self.computeAccuracy(moves: collected)
         try await store.replaceAnalysis(gameId: gameId, analyses: collected)
         progress?(total, total)
         return AnalysisResult(moves: collected, accuracyPercent: accuracy)
@@ -36,58 +36,79 @@ actor AnalysisService {
 
     func streamAnalysis(pgn: String, coachLines: Bool) -> AsyncThrowingStream<MoveAnalysis, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let analysisTask = Task { [weak self] in
+                guard let self else {
+                    continuation.finish()
+                    return
+                }
                 do {
-                    let (whiteRating, blackRating, parsedMoves) = try await MainActor.run {
-                        let whiteRating = AnalysisService.parseRating(from: PGNParser.extractHeader(from: pgn, key: "WhiteElo"))
-                        let blackRating = AnalysisService.parseRating(from: PGNParser.extractHeader(from: pgn, key: "BlackElo"))
-                        let sanMoves = PGNParser.extractMoves(from: pgn)
-                        let parsedMoves = try SANParser.parseMoves(pgnMoves: sanMoves)
+                    // Parse PGN off main thread for better performance
+                    let (whiteRating, blackRating, parsedMoves) = try await Task.detached(priority: .userInitiated) {
+                        // Some parsing helpers may be MainActor-isolated under Swift 6 strict concurrency;
+                        // keep the heavy lifting off-main, but hop to MainActor for those helpers if required.
+                        let (whiteHeader, blackHeader, parsedMoves) = try await MainActor.run {
+                            let whiteHeader = PGNParser.extractHeader(from: pgn, key: "WhiteElo")
+                            let blackHeader = PGNParser.extractHeader(from: pgn, key: "BlackElo")
+                            let sanMoves = PGNParser.extractMoves(from: pgn)
+                            let parsedMoves = try SANParser.parseMoves(pgnMoves: sanMoves)
+                            return (whiteHeader, blackHeader, parsedMoves)
+                        }
+                        let whiteRating = AnalysisService.parseRating(from: whiteHeader)
+                        let blackRating = AnalysisService.parseRating(from: blackHeader)
                         return (whiteRating, blackRating, parsedMoves)
-                    }
-                    let uciMoves = parsedMoves.map { uciString($0.0) }
+                    }.value
 
-                    let depthCap = await effectiveDepthCap()
+                    let uciMoves = parsedMoves.map { Self.uciString($0.0) }
+
+                    // Validate that uciMoves and parsedMoves have same length
+                    guard uciMoves.count == parsedMoves.count else {
+                        throw AnalysisError.moveParseMismatch
+                    }
+
+                    let depthCap = await self.effectiveDepthCap()
                     let timeLimitMs = 1000
                     let multiPV = coachLines ? 3 : 1
 
                     for (index, moveInfo) in parsedMoves.enumerated() {
                         try Task.checkCancellation()
                         let (move, beforePosition) = moveInfo
-                        let afterPosition = await MainActor.run {
-                            MoveGenerator.apply(move: move, to: beforePosition)
-                        }
+
+                        // Generate FEN for the position before the move
+                        let beforeFen = await MainActor.run { beforePosition.fen() }
+
+                        let afterPosition = await MainActor.run { MoveGenerator.apply(move: move, to: beforePosition) }
+
                         let beforeMoves = Array(uciMoves.prefix(index))
                         let afterMoves = Array(uciMoves.prefix(index + 1))
                         let mover: PieceColor = (index % 2 == 0) ? .white : .black
                         let afterSide: PieceColor = (mover == .white) ? .black : .white
                         let moverRating = mover == .white ? whiteRating : blackRating
 
-                        let beforeAnalysis = try await engine.analyze(
+                        let beforeAnalysis = try await self.engine.analyze(
                             positionMoves: beforeMoves,
                             timeLimitMs: timeLimitMs,
                             depthCap: depthCap,
                             multiPV: multiPV
                         )
-                        let afterAnalysis = try await engine.analyze(
+                        let afterAnalysis = try await self.engine.analyze(
                             positionMoves: afterMoves,
                             timeLimitMs: timeLimitMs,
                             depthCap: depthCap,
                             multiPV: multiPV
                         )
 
-                        let evalBefore = normalizeEvalToWhite(beforeAnalysis.evalCp, sideToMove: mover)
-                        let evalAfter = normalizeEvalToWhite(afterAnalysis.evalCp, sideToMove: afterSide)
-                        let loss = computeLoss(evalBeforeWhite: evalBefore, evalAfterWhite: evalAfter, mover: mover)
-                        let isCheckmate = await MainActor.run {
-                            MoveGenerator.isCheckmate(position: afterPosition)
-                        }
-                        let classification = classifyMove(
+                        let evalBefore = Self.normalizeEvalToWhite(beforeAnalysis.evalCp, sideToMove: mover)
+                        let evalAfter = Self.normalizeEvalToWhite(afterAnalysis.evalCp, sideToMove: afterSide)
+                        let loss = Self.computeLoss(evalBeforeWhite: evalBefore, evalAfterWhite: evalAfter, mover: mover)
+
+                        let isCheckmate = await MainActor.run { MoveGenerator.isCheckmate(position: afterPosition) }
+
+                        let classification = Self.classifyMove(
                             loss: loss,
                             evalBefore: evalBefore,
                             evalAfter: evalAfter,
                             bestMoveUci: beforeAnalysis.bestMoveUci,
-                            playedMoveUci: uciString(move),
+                            playedMoveUci: Self.uciString(move),
                             mover: mover,
                             ply: index + 1,
                             rating: moverRating,
@@ -98,8 +119,8 @@ actor AnalysisService {
 
                         let analysis = MoveAnalysis(
                             ply: index + 1,
-                            fen: "startpos",
-                            playedUci: uciString(move),
+                            fen: beforeFen,  // Store actual FEN instead of "startpos"
+                            playedUci: Self.uciString(move),
                             bestUci: beforeAnalysis.bestMoveUci,
                             evalBefore: evalBefore,
                             evalAfter: evalAfter,
@@ -113,6 +134,22 @@ actor AnalysisService {
                 } catch {
                     continuation.finish(throwing: error)
                 }
+            }
+
+            // Handle cancellation properly
+            continuation.onTermination = { @Sendable _ in
+                analysisTask.cancel()
+            }
+        }
+    }
+
+    enum AnalysisError: LocalizedError {
+        case moveParseMismatch
+
+        var errorDescription: String? {
+            switch self {
+            case .moveParseMismatch:
+                return "Failed to parse game moves correctly."
             }
         }
     }
@@ -140,11 +177,11 @@ actor AnalysisService {
         return 20
     }
 
-    private func normalizeEvalToWhite(_ evalCp: Int, sideToMove: PieceColor) -> Int {
+    private nonisolated static func normalizeEvalToWhite(_ evalCp: Int, sideToMove: PieceColor) -> Int {
         return sideToMove == .white ? evalCp : -evalCp
     }
 
-    private func computeLoss(evalBeforeWhite: Int, evalAfterWhite: Int, mover: PieceColor) -> Int {
+    private nonisolated static func computeLoss(evalBeforeWhite: Int, evalAfterWhite: Int, mover: PieceColor) -> Int {
         if mover == .white {
             return max(0, evalBeforeWhite - evalAfterWhite)
         } else {
@@ -152,7 +189,7 @@ actor AnalysisService {
         }
     }
 
-    private func classifyMove(
+    private nonisolated static func classifyMove(
         loss: Int,
         evalBefore: Int,
         evalAfter: Int,
@@ -236,14 +273,14 @@ actor AnalysisService {
         return value
     }
 
-    private func materialScore(position: ChessPosition, color: PieceColor) -> Double {
+    private nonisolated static func materialScore(position: ChessPosition, color: PieceColor) -> Double {
         position.board.compactMap { $0 }.reduce(0.0) { sum, piece in
             guard piece.color == color else { return sum }
             return sum + materialValue(piece.type)
         }
     }
 
-    private func materialValue(_ type: PieceType) -> Double {
+    private nonisolated static func materialValue(_ type: PieceType) -> Double {
         switch type {
         case .pawn: return 1
         case .knight, .bishop: return 3
@@ -253,7 +290,7 @@ actor AnalysisService {
         }
     }
 
-    private func computeAccuracy(moves: [MoveAnalysis]) -> Double {
+    private nonisolated static func computeAccuracy(moves: [MoveAnalysis]) -> Double {
         guard !moves.isEmpty else { return 0 }
         // Calculate Average Centipawn Loss (ACPL)
         let totalLoss = moves.reduce(0) { $0 + $1.loss }
@@ -264,11 +301,12 @@ actor AnalysisService {
         return max(0, min(100, (accuracy * 10).rounded() / 10))
     }
 
-    private func uciString(_ move: ChessMove) -> String {
+    private nonisolated static func uciString(_ move: ChessMove) -> String {
         func squareName(index: Int) -> String {
             let file = index % 8
             let rank = 8 - (index / 8)
-            let fileChar = String(UnicodeScalar(97 + file)!)
+            guard let scalar = UnicodeScalar(97 + file) else { return "a\(rank)" }
+            let fileChar = String(scalar)
             return "\(fileChar)\(rank)"
         }
         var uci = "\(squareName(index: move.from))\(squareName(index: move.to))"

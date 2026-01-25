@@ -22,6 +22,9 @@ final class GamesViewModel: ObservableObject {
     private let queue = AnalysisQueue.shared
     private let latestImportedKey = "chesscom.latestImported"
 
+    /// Cache for parsed PGN metadata to avoid repeated parsing
+    private let metadataCache = PGNMetadataCache()
+
     func loadRemoteGames(username: String, token: String) async {
         guard !username.isEmpty else {
             remoteGames = []
@@ -74,6 +77,65 @@ final class GamesViewModel: ObservableObject {
             await loadDownloadedGames()
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Retry analysis for a failed game
+    func retryAnalysis(gameId: UUID, settings: AppSettings) async {
+        // Find the game metadata
+        guard let game = downloadedGames.first(where: { $0.id == gameId }) else {
+            errorMessage = "Game not found"
+            return
+        }
+
+        // Clear the previous error
+        if lastAnalysisError?.gameId == gameId {
+            lastAnalysisError = nil
+        }
+
+        // Delete any existing partial analysis
+        do {
+            try await store.deleteAnalysis(gameId: gameId)
+        } catch {
+            // Ignore deletion errors, proceed with retry
+        }
+
+        // Read the PGN from disk
+        guard let pgnData = try? Data(contentsOf: URL(fileURLWithPath: game.pgnPath)),
+              let pgn = String(data: pgnData, encoding: .utf8) else {
+            errorMessage = "Failed to read game data"
+            return
+        }
+
+        // Re-queue the analysis
+        analyzingIds.insert(game.id)
+        analyzingProgress[game.id] = 0
+        await queue.enqueue { [weak self] in
+            guard let self else { return }
+            await self.analyzeDownloadedGame(game: game, pgn: pgn, coachLines: settings.coachLines)
+        }
+    }
+
+    /// Retry a failed download with exponential backoff
+    func retryDownload(game: RemoteGame, settings: AppSettings, attempt: Int = 0) async {
+        let maxAttempts = 3
+        guard attempt < maxAttempts else {
+            errorMessage = "Download failed after \(maxAttempts) attempts"
+            return
+        }
+
+        // Apply exponential backoff delay for retries
+        if attempt > 0 {
+            let delayMs = UInt64(500 * (1 << attempt)) // 500ms, 1s, 2s
+            try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
+        }
+
+        await download(game: game, settings: settings)
+
+        // Check if download succeeded - if still in downloading state, it failed
+        if downloadingIds.contains(game.id) {
+            downloadingIds.remove(game.id)
+            await retryDownload(game: game, settings: settings, attempt: attempt + 1)
         }
     }
 
@@ -179,39 +241,78 @@ final class GamesViewModel: ObservableObject {
     }
 
     private func computeRemoteMetadata(games: [RemoteGame]) {
-        Task.detached { [games] in
-            let parsed = await MainActor.run {
-                games.map { game in
-                    (game.id,
-                     PGNParser.extractMoves(from: game.pgn).count,
-                     GameEndType.fromPGN(game.pgn))
+        Task.detached(priority: .utility) { [weak self, games] in
+            guard let self else { return }
+
+            // Only parse games that aren't already cached
+            var newMoveCounts: [String: Int] = [:]
+            var newEndTypes: [String: GameEndType] = [:]
+
+            for game in games {
+                // Check cache first
+                if let cached = await self.metadataCache.get(id: game.id) {
+                    newMoveCounts[game.id] = cached.moveCount
+                    newEndTypes[game.id] = cached.endType
+                } else {
+                    // Parse and cache - wrap MainActor-isolated calls
+                    let (moveCount, endType) = await MainActor.run {
+                        let moveCount = PGNParser.extractMoves(from: game.pgn).count
+                        let endType = GameEndType.fromPGN(game.pgn)
+                        return (moveCount, endType)
+                    }
+                    await self.metadataCache.set(id: game.id, moveCount: moveCount, endType: endType)
+                    newMoveCounts[game.id] = moveCount
+                    newEndTypes[game.id] = endType
                 }
             }
-            let moveCounts = Dictionary(uniqueKeysWithValues: parsed.map { ($0.0, $0.1) })
-            let endTypes = Dictionary(uniqueKeysWithValues: parsed.map { ($0.0, $0.2) })
+
+            // Build immutable copies to pass to MainActor
+            let finalMoveCounts = newMoveCounts
+            let finalEndTypes = newEndTypes
             await MainActor.run {
-                self.remoteMoveCounts.merge(moveCounts) { _, new in new }
-                self.remoteEndTypes.merge(endTypes) { _, new in new }
+                self.remoteMoveCounts.merge(finalMoveCounts) { _, new in new }
+                self.remoteEndTypes.merge(finalEndTypes) { _, new in new }
             }
         }
     }
 
     private func computeDownloadedMetadata(games: [GameMetadata]) {
-        Task.detached { [games] in
-            let parsed = await MainActor.run {
-                games.compactMap { game -> (UUID, Int, GameEndType)? in
+        Task.detached(priority: .utility) { [weak self, games] in
+            guard let self else { return }
+
+            var newMoveCounts: [UUID: Int] = [:]
+            var newEndTypes: [UUID: GameEndType] = [:]
+
+            for game in games {
+                let stringId = game.id.uuidString
+
+                // Check cache first
+                if let cached = await self.metadataCache.get(id: stringId) {
+                    newMoveCounts[game.id] = cached.moveCount
+                    newEndTypes[game.id] = cached.endType
+                } else {
+                    // Read and parse PGN
                     guard let data = try? Data(contentsOf: URL(fileURLWithPath: game.pgnPath)),
-                          let pgn = String(data: data, encoding: .utf8) else { return nil }
-                    return (game.id,
-                            PGNParser.extractMoves(from: pgn).count,
-                            GameEndType.fromPGN(pgn))
+                          let pgn = String(data: data, encoding: .utf8) else { continue }
+
+                    // Parse on MainActor - wrap MainActor-isolated calls
+                    let (moveCount, endType) = await MainActor.run {
+                        let moveCount = PGNParser.extractMoves(from: pgn).count
+                        let endType = GameEndType.fromPGN(pgn)
+                        return (moveCount, endType)
+                    }
+                    await self.metadataCache.set(id: stringId, moveCount: moveCount, endType: endType)
+                    newMoveCounts[game.id] = moveCount
+                    newEndTypes[game.id] = endType
                 }
             }
-            let moveCounts = Dictionary(uniqueKeysWithValues: parsed.map { ($0.0, $0.1) })
-            let endTypes = Dictionary(uniqueKeysWithValues: parsed.map { ($0.0, $0.2) })
+
+            // Build immutable copies to pass to MainActor
+            let finalMoveCounts = newMoveCounts
+            let finalEndTypes = newEndTypes
             await MainActor.run {
-                self.downloadedMoveCounts.merge(moveCounts) { _, new in new }
-                self.downloadedEndTypes.merge(endTypes) { _, new in new }
+                self.downloadedMoveCounts.merge(finalMoveCounts) { _, new in new }
+                self.downloadedEndTypes.merge(finalEndTypes) { _, new in new }
             }
         }
     }
@@ -318,5 +419,44 @@ private struct RemoteGamesCache {
         }
         let safe = username.lowercased().replacingOccurrences(of: "/", with: "_")
         return dir.appendingPathComponent("remote_games_\(safe).json")
+    }
+}
+
+/// Thread-safe cache for parsed PGN metadata with LRU eviction
+private actor PGNMetadataCache {
+    struct Entry {
+        let moveCount: Int
+        let endType: GameEndType
+        let accessTime: Date
+    }
+
+    private var cache: [String: Entry] = [:]
+    private let maxEntries = 500
+
+    func get(id: String) -> Entry? {
+        guard var entry = cache[id] else { return nil }
+        // Update access time for LRU
+        entry = Entry(moveCount: entry.moveCount, endType: entry.endType, accessTime: Date())
+        cache[id] = entry
+        return entry
+    }
+
+    func set(id: String, moveCount: Int, endType: GameEndType) {
+        // Evict oldest entries if at capacity
+        if cache.count >= maxEntries {
+            evictOldest(count: maxEntries / 10)
+        }
+        cache[id] = Entry(moveCount: moveCount, endType: endType, accessTime: Date())
+    }
+
+    private func evictOldest(count: Int) {
+        let sorted = cache.sorted { $0.value.accessTime < $1.value.accessTime }
+        for (key, _) in sorted.prefix(count) {
+            cache.removeValue(forKey: key)
+        }
+    }
+
+    func clear() {
+        cache.removeAll()
     }
 }
