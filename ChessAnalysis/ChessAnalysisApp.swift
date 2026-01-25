@@ -21,7 +21,7 @@ struct ChessAnalysisApp: App {
             ContentView()
                 .onAppear {
                     Task {
-                        try? await GameStore.shared.deleteIncompleteDownloads()
+                        // Don't delete incomplete downloads - show them with retry button instead
                         await StockfishEngine.shared.runSmokeTest(seconds: 3)
                     }
                 }

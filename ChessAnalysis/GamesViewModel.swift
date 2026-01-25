@@ -103,7 +103,14 @@ final class GamesViewModel: ObservableObject {
         // Read the PGN from disk
         guard let pgnData = try? Data(contentsOf: URL(fileURLWithPath: game.pgnPath)),
               let pgn = String(data: pgnData, encoding: .utf8) else {
-            errorMessage = "Failed to read game data"
+            // PGN file is missing or corrupted - delete this orphaned game entry
+            errorMessage = "Game data is missing. Removing from list."
+            do {
+                try await store.deleteGame(gameId: gameId)
+                await loadDownloadedGames()
+            } catch {
+                // Ignore cleanup errors
+            }
             return
         }
 
@@ -117,43 +124,41 @@ final class GamesViewModel: ObservableObject {
     }
 
     /// Retry a failed download with exponential backoff
-    func retryDownload(game: RemoteGame, settings: AppSettings, attempt: Int = 0) async {
+    func retryDownload(game: RemoteGame, settings: AppSettings) async {
         let maxAttempts = 3
-        guard attempt < maxAttempts else {
-            errorMessage = "Download failed after \(maxAttempts) attempts"
+        var lastError: Error?
+
+        for attempt in 0..<maxAttempts {
+            // Apply exponential backoff delay for retries (skip first attempt)
+            if attempt > 0 {
+                let delayNs = UInt64(500_000_000 * (1 << attempt)) // 500ms, 1s, 2s
+                try? await Task.sleep(nanoseconds: delayNs)
+            }
+
+            do {
+                try await downloadWithError(game: game, settings: settings)
+                return // Success
+            } catch is CancellationError {
+                return // User cancelled
+            } catch {
+                lastError = error
+                continue // Retry
+            }
+        }
+
+        errorMessage = "Download failed after \(maxAttempts) attempts: \(lastError?.localizedDescription ?? "Unknown error")"
+    }
+
+    /// Download that throws on failure instead of setting errorMessage
+    private func downloadWithError(game: RemoteGame, settings: AppSettings) async throws {
+        guard !downloadingIds.contains(game.id),
+              !downloadedGames.contains(where: { $0.remoteId == game.id }) else {
             return
         }
+        downloadingIds.insert(game.id)
+        lastAnalysisError = nil
 
-        // Apply exponential backoff delay for retries
-        if attempt > 0 {
-            let delayMs = UInt64(500 * (1 << attempt)) // 500ms, 1s, 2s
-            try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
-        }
-
-        await download(game: game, settings: settings)
-
-        // Check if download succeeded - if still in downloading state, it failed
-        if downloadingIds.contains(game.id) {
-            downloadingIds.remove(game.id)
-            await retryDownload(game: game, settings: settings, attempt: attempt + 1)
-        }
-    }
-
-    func importPGN(_ pgn: String, settings: AppSettings) async {
-        let trimmed = pgn.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let remoteGame = remoteGameFromPGN(trimmed)
-        await download(game: remoteGame, settings: settings)
-    }
-
-    func download(game: RemoteGame, settings: AppSettings) async {
         do {
-            guard !downloadingIds.contains(game.id),
-                  !downloadedGames.contains(where: { $0.remoteId == game.id }) else {
-                return
-            }
-            downloadingIds.insert(game.id)
-            lastAnalysisError = nil
             let pgnData = Data(game.pgn.utf8)
             let capBytes = Int64(settings.storageCapMB) * 1_048_576
             try await store.enforceStorageLimit(extraBytes: Int64(pgnData.count), capBytes: capBytes)
@@ -167,10 +172,25 @@ final class GamesViewModel: ObservableObject {
                 guard let self else { return }
                 await self.analyzeDownloadedGame(game: metadata, pgn: game.pgn, coachLines: settings.coachLines)
             }
+        } catch {
+            downloadingIds.remove(game.id)
+            throw error
+        }
+    }
+
+    func importPGN(_ pgn: String, settings: AppSettings) async {
+        let trimmed = pgn.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let remoteGame = remoteGameFromPGN(trimmed)
+        await download(game: remoteGame, settings: settings)
+    }
+
+    func download(game: RemoteGame, settings: AppSettings) async {
+        do {
+            try await downloadWithError(game: game, settings: settings)
         } catch is CancellationError {
             return
         } catch {
-            downloadingIds.remove(game.id)
             errorMessage = error.localizedDescription
         }
     }

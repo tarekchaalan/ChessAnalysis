@@ -15,7 +15,8 @@ actor GameStore {
     func saveDownloadedGame(remote: RemoteGame, pgnData: Data) async throws -> GameMetadata {
         let directory = try ensureGamesDirectory()
         let safeId = safeFilename(remote.id)
-        let pgnURL = directory.appendingPathComponent("\(safeId).pgn")
+        let filename = "\(safeId).pgn"
+        let pgnURL = directory.appendingPathComponent(filename)
         try pgnData.write(to: pgnURL, options: .atomic)
         let bytes = Int64((try? FileManager.default.attributesOfItem(atPath: pgnURL.path)[.size] as? NSNumber)?.int64Value ?? 0)
         let summary = GameSummary(
@@ -38,15 +39,17 @@ actor GameStore {
                 entity.id = UUID()
                 entity.remoteId = remote.id
             }
-            entity.pgnPath = pgnURL.path
+            // Store only the filename, not the full path (container UUID can change between launches)
+            entity.pgnPath = filename
             entity.downloadedAt = Date()
             entity.analysisVersion = Int32(self.analysisVersion)
             entity.bytesOnDisk = bytes
             try context.save()
+            // Return the full path for immediate use
             return GameMetadata(
                 id: entity.id,
                 remoteId: entity.remoteId,
-                pgnPath: entity.pgnPath,
+                pgnPath: pgnURL.path,
                 downloadedAt: entity.downloadedAt,
                 lastAnalyzedAt: entity.lastAnalyzedAt,
                 analysisVersion: Int(entity.analysisVersion),
@@ -57,15 +60,38 @@ actor GameStore {
     }
 
     func fetchDownloadedGames() async throws -> [GameMetadata] {
+        let gamesDirectory = try ensureGamesDirectory()
         let context = controller.container.newBackgroundContext()
         return try await context.perform {
             let fetch: NSFetchRequest<GameEntity> = GameEntity.fetchRequest()
             fetch.sortDescriptors = [NSSortDescriptor(key: "downloadedAt", ascending: false)]
             let entities = try context.fetch(fetch)
-            return entities.compactMap { entity in
-                guard let pgnData = try? Data(contentsOf: URL(fileURLWithPath: entity.pgnPath)),
+
+            var needsSave = false
+            var results: [GameMetadata] = []
+
+            for entity in entities {
+                // Migrate legacy absolute paths to relative filenames
+                let (fullPath, didMigrate) = self.resolveAndMigratePath(
+                    storedPath: entity.pgnPath,
+                    gamesDirectory: gamesDirectory
+                )
+
+                if didMigrate {
+                    // Update entity with relative filename
+                    let filename = (fullPath as NSString).lastPathComponent
+                    entity.pgnPath = filename
+                    needsSave = true
+                }
+
+                // Try to read the PGN file
+                guard let pgnData = try? Data(contentsOf: URL(fileURLWithPath: fullPath)),
                       let pgn = String(data: pgnData, encoding: .utf8)
-                else { return nil }
+                else {
+                    // File doesn't exist - skip this game (it's orphaned)
+                    continue
+                }
+
                 let whiteEloStr = PGNParser.extractHeader(from: pgn, key: "WhiteElo")
                 let blackEloStr = PGNParser.extractHeader(from: pgn, key: "BlackElo")
                 let summary = GameSummary(
@@ -77,18 +103,46 @@ actor GameStore {
                     gameDate: PGNParser.extractHeader(from: pgn, key: "Date") ?? "",
                     timeControl: PGNParser.extractHeader(from: pgn, key: "TimeControl") ?? ""
                 )
-                return GameMetadata(
+
+                results.append(GameMetadata(
                     id: entity.id,
                     remoteId: entity.remoteId,
-                    pgnPath: entity.pgnPath,
+                    pgnPath: fullPath,
                     downloadedAt: entity.downloadedAt,
                     lastAnalyzedAt: entity.lastAnalyzedAt,
                     analysisVersion: Int(entity.analysisVersion),
                     bytesOnDisk: entity.bytesOnDisk,
                     summary: summary
-                )
+                ))
             }
+
+            // Save migrated paths
+            if needsSave {
+                try? context.save()
+            }
+
+            return results
         }
+    }
+
+    /// Resolves a stored path to a full filesystem path, migrating legacy paths.
+    /// Returns (fullPath, didMigrate) where didMigrate is true if the path was a legacy absolute path.
+    private nonisolated func resolveAndMigratePath(storedPath: String, gamesDirectory: URL) -> (String, Bool) {
+        // If it's already a relative filename, just construct the full path
+        if !storedPath.hasPrefix("/") {
+            return (gamesDirectory.appendingPathComponent(storedPath).path, false)
+        }
+
+        // Legacy absolute path - extract filename and use current games directory
+        let filename = (storedPath as NSString).lastPathComponent
+        let newPath = gamesDirectory.appendingPathComponent(filename).path
+        return (newPath, true)
+    }
+
+    /// Resolves a stored path to a full filesystem path (for use in other methods).
+    private nonisolated func resolveFullPath(storedPath: String, gamesDirectory: URL) -> String {
+        let (path, _) = resolveAndMigratePath(storedPath: storedPath, gamesDirectory: gamesDirectory)
+        return path
     }
 
     func fetchAnalysis(gameId: UUID) async throws -> [MoveAnalysis] {
@@ -115,6 +169,7 @@ actor GameStore {
     }
 
     func replaceAnalysis(gameId: UUID, analyses: [MoveAnalysis]) async throws {
+        let gamesDirectory = try ensureGamesDirectory()
         let context = controller.container.newBackgroundContext()
         try await context.perform {
             let gameFetch: NSFetchRequest<GameEntity> = GameEntity.fetchRequest()
@@ -142,7 +197,8 @@ actor GameStore {
                 entity.pv = analysis.pv
             }
 
-            let pgnBytes = (try? FileManager.default.attributesOfItem(atPath: game.pgnPath)[.size] as? NSNumber)?.int64Value ?? 0
+            let fullPath = self.resolveFullPath(storedPath: game.pgnPath, gamesDirectory: gamesDirectory)
+            let pgnBytes = (try? FileManager.default.attributesOfItem(atPath: fullPath)[.size] as? NSNumber)?.int64Value ?? 0
             let analysisBytes = analyses.reduce(Int64(0)) { sum, analysis in
                 sum + Int64(analysis.fen.count + analysis.playedUci.count + analysis.bestUci.count + analysis.pv.count) + 32
             }
@@ -153,6 +209,7 @@ actor GameStore {
     }
 
     func deleteAnalysis(gameId: UUID) async throws {
+        let gamesDirectory = try ensureGamesDirectory()
         let context = controller.container.newBackgroundContext()
         try await context.perform {
             let gameFetch: NSFetchRequest<GameEntity> = GameEntity.fetchRequest()
@@ -166,7 +223,8 @@ actor GameStore {
                 context.delete(item)
             }
 
-            let pgnBytes = (try? FileManager.default.attributesOfItem(atPath: game.pgnPath)[.size] as? NSNumber)?.int64Value ?? 0
+            let fullPath = self.resolveFullPath(storedPath: game.pgnPath, gamesDirectory: gamesDirectory)
+            let pgnBytes = (try? FileManager.default.attributesOfItem(atPath: fullPath)[.size] as? NSNumber)?.int64Value ?? 0
             game.bytesOnDisk = pgnBytes
             game.lastAnalyzedAt = nil
             try context.save()
@@ -174,13 +232,14 @@ actor GameStore {
     }
 
     func deleteGame(gameId: UUID) async throws {
+        let gamesDirectory = try ensureGamesDirectory()
         let context = controller.container.newBackgroundContext()
         try await context.perform {
             let fetch: NSFetchRequest<GameEntity> = GameEntity.fetchRequest()
             fetch.predicate = NSPredicate(format: "id == %@", gameId as CVarArg)
             guard let game = try context.fetch(fetch).first else { return }
 
-            let pgnPath = game.pgnPath
+            let fullPath = self.resolveFullPath(storedPath: game.pgnPath, gamesDirectory: gamesDirectory)
 
             // Delete from database first
             context.delete(game)
@@ -188,18 +247,19 @@ actor GameStore {
 
             // Only delete file after database save succeeds
             // This prevents orphaned DB records if file deletion fails
-            if FileManager.default.fileExists(atPath: pgnPath) {
+            if FileManager.default.fileExists(atPath: fullPath) {
                 do {
-                    try FileManager.default.removeItem(atPath: pgnPath)
+                    try FileManager.default.removeItem(atPath: fullPath)
                 } catch {
                     // Log but don't fail - orphaned file is better than orphaned DB record
-                    print("[GameStore] Failed to delete PGN file at \(pgnPath): \(error)")
+                    print("[GameStore] Failed to delete PGN file at \(fullPath): \(error)")
                 }
             }
         }
     }
 
     func deleteIncompleteDownloads() async throws {
+        let gamesDirectory = try ensureGamesDirectory()
         let context = controller.container.newBackgroundContext()
         try await context.perform {
             let fetch: NSFetchRequest<GameEntity> = GameEntity.fetchRequest()
@@ -212,8 +272,9 @@ actor GameStore {
                 for item in analyses {
                     context.delete(item)
                 }
-                if FileManager.default.fileExists(atPath: game.pgnPath) {
-                    try? FileManager.default.removeItem(atPath: game.pgnPath)
+                let fullPath = self.resolveFullPath(storedPath: game.pgnPath, gamesDirectory: gamesDirectory)
+                if FileManager.default.fileExists(atPath: fullPath) {
+                    try? FileManager.default.removeItem(atPath: fullPath)
                 }
                 context.delete(game)
             }
@@ -222,6 +283,7 @@ actor GameStore {
     }
 
     func enforceStorageLimit(extraBytes: Int64, capBytes: Int64) async throws {
+        let gamesDirectory = try ensureGamesDirectory()
         let context = controller.container.newBackgroundContext()
         try await context.perform {
             let fetch: NSFetchRequest<GameEntity> = GameEntity.fetchRequest()
@@ -246,8 +308,9 @@ actor GameStore {
             while runningTotal + extraBytes > capBytes || Double(runningTotal + extraBytes) / Double(capBytes) >= 0.95 {
                 guard let next = ordered.first else { break }
                 ordered.removeFirst()
-                if FileManager.default.fileExists(atPath: next.pgnPath) {
-                    try FileManager.default.removeItem(atPath: next.pgnPath)
+                let fullPath = self.resolveFullPath(storedPath: next.pgnPath, gamesDirectory: gamesDirectory)
+                if FileManager.default.fileExists(atPath: fullPath) {
+                    try FileManager.default.removeItem(atPath: fullPath)
                 }
                 runningTotal -= next.bytesOnDisk
                 context.delete(next)
