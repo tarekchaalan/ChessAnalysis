@@ -173,7 +173,9 @@ actor StatisticsService {
 
         // Capture as immutable before passing to MainActor
         let finalRawData = rawData
-        return finalRawData.map { RatingDataPoint(date: $0.date, rating: $0.rating, timeClass: $0.timeClass) }
+        return await MainActor.run {
+            finalRawData.map { RatingDataPoint(date: $0.date, rating: $0.rating, timeClass: $0.timeClass) }
+        }
     }
 
     // MARK: - Opening Stats
