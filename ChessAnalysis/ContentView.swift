@@ -9,12 +9,17 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var settings = AppSettings()
+    @StateObject private var gamesViewModel = GamesViewModel()
 
     var body: some View {
         TabView {
-            GamesHomeView(settings: settings)
+            GamesHomeView(viewModel: gamesViewModel, settings: settings)
                 .tabItem {
                     Label("Games", systemImage: "list.bullet.rectangle")
+                }
+            StatsView(gamesViewModel: gamesViewModel, settings: settings)
+                .tabItem {
+                    Label("Statistics", systemImage: "chart.bar.xaxis")
                 }
             SettingsView(settings: settings)
                 .tabItem {

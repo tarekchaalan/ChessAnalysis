@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct GamesHomeView: View {
-    @StateObject private var viewModel = GamesViewModel()
+    @ObservedObject var viewModel: GamesViewModel
     @ObservedObject var settings: AppSettings
     @State private var segment: Int = 0
     @State private var searchText: String = ""

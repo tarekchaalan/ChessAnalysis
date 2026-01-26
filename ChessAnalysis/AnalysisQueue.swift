@@ -14,6 +14,7 @@ actor AnalysisQueue {
     private var queue: [@Sendable () async throws -> Void] = []
     private var state: State = .idle
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private var isBackgroundTaskPending = false  // Prevents race condition in beginBackgroundTask
 
     func enqueue(_ operation: @escaping @Sendable () async throws -> Void) {
         queue.append(operation)
@@ -70,7 +71,10 @@ actor AnalysisQueue {
     }
 
     private func beginBackgroundTask() {
-        guard backgroundTask == .invalid else { return }
+        // Check both the actual task AND the pending flag to prevent race condition
+        guard backgroundTask == .invalid && !isBackgroundTaskPending else { return }
+        isBackgroundTaskPending = true  // Set immediately to prevent duplicate requests
+
         Task { @MainActor [weak self] in
             guard let self else { return }
             let taskId = UIApplication.shared.beginBackgroundTask(withName: "AnalysisQueue") {
@@ -82,12 +86,17 @@ actor AnalysisQueue {
 
     private func setBackgroundTask(_ id: UIBackgroundTaskIdentifier) {
         backgroundTask = id
+        isBackgroundTaskPending = false  // Clear pending flag once we have the actual task
     }
 
     private func endBackgroundTask() {
-        guard backgroundTask != .invalid else { return }
+        guard backgroundTask != .invalid else {
+            isBackgroundTaskPending = false  // Clear pending flag if we're ending without a task
+            return
+        }
         let taskId = backgroundTask
         backgroundTask = .invalid
+        isBackgroundTaskPending = false
         Task { @MainActor in
             UIApplication.shared.endBackgroundTask(taskId)
         }

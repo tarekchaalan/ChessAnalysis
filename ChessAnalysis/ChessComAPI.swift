@@ -39,6 +39,9 @@ struct ChessComAPI {
         ]
         configuration.timeoutIntervalForRequest = 30
         configuration.timeoutIntervalForResource = 60
+        // Disable URL caching to always get fresh data from Chess.com
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
         session = URLSession(configuration: configuration)
     }
 
@@ -54,7 +57,11 @@ struct ChessComAPI {
     }
 
     func fetchGamesFromArchive(_ archiveURL: URL) async throws -> [RemoteGame] {
-        var request = URLRequest(url: archiveURL)
+        // Add cache-busting parameter to bypass Chess.com's CDN cache
+        var components = URLComponents(url: archiveURL, resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "_t", value: String(Int(Date().timeIntervalSince1970)))]
+        var request = URLRequest(url: components.url!)
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         addAuthHeader(to: &request)
         let (data, response) = try await performRequest(request)
         try validateResponse(response, for: nil)
@@ -66,12 +73,32 @@ struct ChessComAPI {
 
     func fetchAllGames(username: String, limitMonths: Int?, since: Date? = nil) async throws -> [RemoteGame] {
         var archives = try await fetchMonthlyArchives(username: username)
+
+        // Always include the current month's archive to catch recent games
+        // Chess.com archives are sorted oldest to newest, so last archive is current month
+        let currentMonthArchive = archives.last
+
+        #if DEBUG
+        print("[ChessComAPI] Total archives: \(archives.count), current month: \(currentMonthArchive?.lastPathComponent ?? "none")")
+        if let since {
+            print("[ChessComAPI] Using since filter: \(since)")
+        }
+        #endif
+
         if let since {
             archives = archives.filter { archiveIsOnOrAfter(archiveURL: $0, date: since) }
+            // Ensure current month is always included even if 'since' would filter it out
+            if let current = currentMonthArchive, !archives.contains(current) {
+                archives.append(current)
+            }
         }
         if let limitMonths, limitMonths > 0, archives.count > limitMonths {
             archives = Array(archives.suffix(limitMonths))
         }
+
+        #if DEBUG
+        print("[ChessComAPI] Fetching \(archives.count) archives")
+        #endif
 
         var allGames: [RemoteGame] = []
         for archive in archives {
@@ -80,8 +107,21 @@ struct ChessComAPI {
                 try await Task.sleep(nanoseconds: 100_000_000) // 100ms
             }
             let games = try await fetchGamesFromArchive(archive)
+            #if DEBUG
+            print("[ChessComAPI] Archive \(archive.lastPathComponent): \(games.count) games")
+            if let newest = games.max(by: { ($0.endTime ?? .distantPast) < ($1.endTime ?? .distantPast) }) {
+                print("[ChessComAPI]   Newest in archive: \(newest.whitePlayer) vs \(newest.blackPlayer), endTime: \(newest.endTime?.description ?? "nil")")
+            }
+            #endif
             if let since {
-                allGames.append(contentsOf: games.filter { ($0.endTime ?? .distantPast) >= since })
+                // For current month, always include all games (don't filter by since)
+                // This ensures we catch games that were just played
+                let isCurrentMonth = archive == currentMonthArchive
+                if isCurrentMonth {
+                    allGames.append(contentsOf: games)
+                } else {
+                    allGames.append(contentsOf: games.filter { ($0.endTime ?? .distantPast) >= since })
+                }
             } else {
                 allGames.append(contentsOf: games)
             }

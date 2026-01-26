@@ -128,4 +128,25 @@ enum PGNParser {
             return String(pgn[valueRange])
         }
     }
+
+    static func extractECO(from pgn: String) -> String? {
+        extractHeader(from: pgn, key: "ECO")
+    }
+
+    static func extractOpeningName(from pgn: String) -> String? {
+        // Try "Opening" header first
+        if let opening = extractHeader(from: pgn, key: "Opening") {
+            return opening
+        }
+        // Fallback: parse ECOUrl like "https://www.chess.com/openings/Queens-Pawn-Opening-Mikenas-Defense"
+        if let ecoUrl = extractHeader(from: pgn, key: "ECOUrl"),
+           let lastComponent = ecoUrl.split(separator: "/").last {
+            return String(lastComponent).replacingOccurrences(of: "-", with: " ")
+        }
+        return nil
+    }
+
+    static func extractTermination(from pgn: String) -> String? {
+        extractHeader(from: pgn, key: "Termination")
+    }
 }

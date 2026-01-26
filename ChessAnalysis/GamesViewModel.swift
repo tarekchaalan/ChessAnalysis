@@ -37,14 +37,31 @@ final class GamesViewModel: ObservableObject {
         isLoading = remoteGames.isEmpty
         do {
             let api = ChessComAPI(token: token.isEmpty ? nil : token)
-            // Only use 'since' optimization if we have cached games
+            // Use 'since' optimization to avoid re-fetching old archives
+            // The API always fetches current month fresh to catch new games
             let since = cached.isEmpty ? nil : latestImportedDate()
             let newGames = try await api.fetchAllGames(username: username, limitMonths: nil, since: since)
-            // Merge new games with cached games, avoiding duplicates
-            let existingIds = Set(cached.map { $0.id })
-            let uniqueNewGames = newGames.filter { !existingIds.contains($0.id) }
-            let allGames = (cached + uniqueNewGames).sorted { ($0.endTime ?? .distantPast) > ($1.endTime ?? .distantPast) }
+
+            // Merge games, preferring fresh API data over cached data
+            // Start with new games, then add cached games that aren't in the new set
+            var mergedGames: [RemoteGame] = newGames
+            let newIds = Set(newGames.map { $0.id })
+            let uniqueCachedGames = cached.filter { !newIds.contains($0.id) }
+            mergedGames.append(contentsOf: uniqueCachedGames)
+
+            let allGames = mergedGames.sorted { ($0.endTime ?? .distantPast) > ($1.endTime ?? .distantPast) }
+
+            #if DEBUG
+            print("[GamesViewModel] Fetched \(newGames.count) from API, \(cached.count) cached, \(uniqueCachedGames.count) unique cached, \(allGames.count) total")
+            if let newest = allGames.first {
+                print("[GamesViewModel] Newest game: \(newest.whitePlayer) vs \(newest.blackPlayer) on \(newest.gameDate)")
+            }
+            #endif
+
+            // Force UI update by clearing first (ensures SwiftUI detects the change)
+            remoteGames = []
             remoteGames = allGames
+
             cache.save(username: username, games: allGames)
             computeRemoteMetadata(games: allGames)
         } catch is CancellationError {

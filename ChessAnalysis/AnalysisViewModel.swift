@@ -14,8 +14,8 @@ final class AnalysisViewModel: ObservableObject {
     private let queue = AnalysisQueue.shared
     private var currentAnalysisTask: Task<Void, Never>?
 
-    // Incremental accuracy tracking for O(1) updates
-    private var runningLossSum: Double = 0
+    // Incremental accuracy tracking
+    private var totalLoss: Int = 0
     private var moveCount: Int = 0
 
     func loadAnalysis(gameId: UUID) async {
@@ -34,7 +34,7 @@ final class AnalysisViewModel: ObservableObject {
         errorMessage = nil
 
         // Reset incremental tracking
-        runningLossSum = 0
+        totalLoss = 0
         moveCount = 0
 
         currentAnalysisTask = Task { [weak self] in
@@ -53,10 +53,13 @@ final class AnalysisViewModel: ObservableObject {
                         try Task.checkCancellation()
                         await MainActor.run {
                             self.analyses.append(move)
-                            // Incremental accuracy update - O(1) instead of O(n)
-                            self.runningLossSum += exp(-Double(move.loss) / 120.0)
+                            // Incremental accuracy update using Chess.com ACPL formula
+                            self.totalLoss += move.loss
                             self.moveCount += 1
-                            self.accuracy = (self.runningLossSum / Double(self.moveCount) * 1000).rounded() / 10.0
+                            self.accuracy = Self.computeAccuracyFromACPL(
+                                totalLoss: self.totalLoss,
+                                moveCount: self.moveCount
+                            )
                         }
                     }
 
@@ -102,17 +105,24 @@ final class AnalysisViewModel: ObservableObject {
         analyses = []
         accuracy = 0
         isPartialAnalysis = false
-        runningLossSum = 0
+        totalLoss = 0
         moveCount = 0
     }
 
     private func computeAccuracy(from moves: [MoveAnalysis]) -> Double {
         guard !moves.isEmpty else { return 0 }
-        let total = moves.reduce(0.0) { sum, move in
-            sum + exp(-Double(move.loss) / 120.0)
-        }
-        let avg = total / Double(moves.count)
-        return (avg * 1000).rounded() / 10.0
+        let totalLoss = moves.reduce(0) { $0 + $1.loss }
+        return Self.computeAccuracyFromACPL(totalLoss: totalLoss, moveCount: moves.count)
+    }
+
+    /// Chess.com-style accuracy formula based on Average Centipawn Loss (ACPL)
+    /// This formula is used consistently across AnalysisService, StatisticsService, and here
+    private static func computeAccuracyFromACPL(totalLoss: Int, moveCount: Int) -> Double {
+        guard moveCount > 0 else { return 0 }
+        let acpl = Double(totalLoss) / Double(moveCount)
+        // Chess.com accuracy formula: 103.1668 * exp(-0.04354 * ACPL) - 3.1669
+        let accuracy = 103.1668 * exp(-0.04354 * acpl) - 3.1669
+        return max(0, min(100, (accuracy * 10).rounded() / 10))
     }
 
     private func formatErrorMessage(_ error: Error) -> String {
